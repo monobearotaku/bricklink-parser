@@ -42,6 +42,7 @@ services:
     depends_on:
       - redis
     restart: unless-stopped
+    vo
     
 volumes:
   postgres_data:

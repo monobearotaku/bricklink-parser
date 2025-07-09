@@ -10,7 +10,9 @@ import (
 
 	"bricklink/parser/internal/config"
 	"bricklink/parser/internal/domain"
+	"bricklink/parser/internal/domain/task"
 	"bricklink/parser/internal/proxy"
+	"bricklink/parser/internal/queue"
 
 	"sync/atomic"
 
@@ -33,9 +35,10 @@ type brickLinkClient struct {
 	httpClient    *resty.Client
 	parser        *catalogParser
 	proxySupplier proxy.ProxySupplier
+	queue         queue.Queue
 }
 
-func NewBrickLinkClient(cfg config.BrickLinkConfig, proxySupplier proxy.ProxySupplier) BrickLinkClient {
+func NewBrickLinkClient(cfg config.BrickLinkConfig, proxySupplier proxy.ProxySupplier, queue queue.Queue) BrickLinkClient {
 	client := resty.New().
 		SetTimeout(60*time.Second).
 		SetRetryCount(3).
@@ -63,6 +66,7 @@ func NewBrickLinkClient(cfg config.BrickLinkConfig, proxySupplier proxy.ProxySup
 		httpClient:    client,
 		parser:        newCatalogParser(cfg.BaseURL),
 		proxySupplier: proxySupplier,
+		queue:         queue,
 	}
 }
 
@@ -117,7 +121,23 @@ func (c *brickLinkClient) GetAllCatalogPages(ctx context.Context, categoryType d
 
 				page, err := c.GetCatalogPage(ctx, categoryType, pageNum)
 				if err != nil {
-					log.Errorf("Failed to fetch page %d: %v", pageNum, err)
+					// Add to retry queue instead of just logging
+					retryTask := &task.PageRetryTask{
+						PageNumber:   pageNum,
+						CategoryType: categoryType,
+						RetryCount:   0,
+						Error:        err.Error(),
+					}
+
+					if c.queue != nil {
+						if _, addErr := c.queue.AddTask(ctx, retryTask); addErr != nil {
+							log.Errorf("❌ Failed to add page %d to retry queue: %v", pageNum, addErr)
+						} else {
+							log.Warnf("🔄 Added page %d to retry queue due to fetch failure: %v", pageNum, err)
+						}
+					} else {
+						log.Errorf("Failed to fetch page %d: %v", pageNum, err)
+					}
 					return
 				}
 
@@ -173,7 +193,24 @@ func (c *brickLinkClient) GetAllCatalogPagesCh(ctx context.Context, categoryType
 
 					page, err := c.GetCatalogPage(ctx, categoryType, pageNum)
 					if err != nil {
-						log.Errorf("Failed to fetch page %d: %v", pageNum, err)
+						// Add to retry queue instead of just logging
+						retryTask := &task.PageRetryTask{
+							PageNumber:   pageNum,
+							CategoryType: categoryType,
+							RetryCount:   0,
+							Error:        err.Error(),
+						}
+
+						if c.queue != nil {
+							if _, addErr := c.queue.AddTask(ctx, retryTask); addErr != nil {
+								log.Errorf("❌ Failed to add page %d to retry queue: %v", pageNum, addErr)
+							} else {
+								log.Warnf("🔄 Added page %d to retry queue due to fetch failure: %v", pageNum, err)
+							}
+						} else {
+							log.Errorf("Failed to fetch page %d: %v", pageNum, err)
+						}
+						<-semaphore
 						return
 					}
 

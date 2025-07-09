@@ -45,10 +45,6 @@ func New(cfg *config.Config) (*Container, error) {
 		return nil, fmt.Errorf("failed to initialize proxy supplier: %w", err)
 	}
 
-	// Initialize client (with internal parser and proxy supplier)
-	brickLinkClient := client.NewBrickLinkClient(cfg.BrickLink, proxySupplier)
-	container.Client = brickLinkClient
-
 	// Initialize repository
 	db, err := pgxpool.New(context.Background(),
 		fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
@@ -88,6 +84,10 @@ func New(cfg *config.Config) (*Container, error) {
 	container.redis = rdb
 	stateManager := state.NewRedisStateManager(rdb)
 	container.StateManager = stateManager
+
+	// Initialize client with queue (after queue is created)
+	brickLinkClient := client.NewBrickLinkClient(cfg.BrickLink, proxySupplier, redisQueue)
+	container.Client = brickLinkClient
 
 	service := service.NewService(
 		partRepo,

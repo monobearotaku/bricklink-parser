@@ -9,7 +9,7 @@ bricklink:
   base_url: http://www.bricklink.com
   timeout: 90
   max_retries: 5
-  max_workers: 16
+  max_workers: 100
   max_requests_per_second: 10
   proxies:
     
