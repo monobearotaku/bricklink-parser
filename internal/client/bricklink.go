@@ -275,6 +275,8 @@ func (c *brickLinkClient) fetchHTML(ctx context.Context, url string) (string, er
 
 	html := resp.String()
 	if strings.Contains(html, "Quota Exceeded") {
+		time.Sleep(120 * time.Second)
+
 		log.Warnf("🚫 Rate limit exceeded for URL: %s", url)
 
 		// Try to get a new proxy from ProxySupplier
