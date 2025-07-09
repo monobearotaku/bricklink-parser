@@ -1,0 +1,29 @@
+# BrickLink Parser Configuration
+# YAML configuration file for the BrickLink part parser application
+
+server:
+  host: localhost
+  port: 8080
+
+bricklink:
+  base_url: http://www.bricklink.com
+  timeout: 90
+  max_retries: 5
+  max_workers: 16
+  max_requests_per_second: 10
+  proxies:
+    
+database:
+  host: localhost
+  port: 5432
+  name: bricklink
+  user: bricklink_user
+  password: bricklink_pass
+
+redis:
+  host: localhost
+  port: 6379
+  password: redis_pass
+  database: 0 
+  consumer_group: bricklink_consumer
+  min_idle_time: 120
