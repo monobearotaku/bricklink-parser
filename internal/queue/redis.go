@@ -17,6 +17,7 @@ type Queue interface {
 	AckTask(ctx context.Context, stream, group, msgID string) error
 	CreateGroup(ctx context.Context, stream, group string) error
 	AutoClaim(ctx context.Context, group, consumer, stream string, minIdleTime time.Duration) ([]redis.XMessage, error)
+	EnsureStreamsExist(ctx context.Context) error
 }
 
 type RedisQueue struct {
@@ -32,14 +33,11 @@ func NewRedisQueue(redisClient *redis.Client, cfg config.RedisConfig) (Queue, er
 		groupName:    cfg.ConsumerGroup,
 	}
 
-	// Create consumer groups for all task types
-	taskTypes := []string{"CatalogPageTask", "PageRetryTask", "ItemRetryTask"}
-	for _, taskType := range taskTypes {
-		streamName := q.streamPrefix + taskType
-		err := q.CreateGroup(context.Background(), streamName, q.groupName)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create consumer group for %s: %w", taskType, err)
-		}
+	// Ensure all streams and consumer groups exist before workers start
+	ctx := context.Background()
+	err := q.EnsureStreamsExist(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to ensure streams exist: %w", err)
 	}
 
 	return q, nil
@@ -143,4 +141,51 @@ func (q *RedisQueue) Close() error {
 // GetRedisClient returns the underlying Redis client for use by other components
 func (q *RedisQueue) GetRedisClient() *redis.Client {
 	return q.redisClient
+}
+
+// EnsureStreamsExist creates all required streams and consumer groups upfront
+func (q *RedisQueue) EnsureStreamsExist(ctx context.Context) error {
+	taskTypes := []string{"CatalogPageTask", "PageRetryTask", "ItemRetryTask"}
+
+	log.Info("🔧 Creating Redis streams and consumer groups...")
+
+	for _, taskType := range taskTypes {
+		streamName := q.streamPrefix + taskType
+
+		// First, try to create a dummy entry to ensure the stream exists
+		// We'll delete this immediately after creating the consumer group
+		dummyID, err := q.redisClient.XAdd(ctx, &redis.XAddArgs{
+			Stream: streamName,
+			Values: map[string]interface{}{
+				"init": "dummy",
+			},
+		}).Result()
+
+		if err != nil {
+			log.Warnf("⚠️ Failed to create stream %s with dummy entry: %v", streamName, err)
+		} else {
+			log.Debugf("✅ Created stream %s with dummy entry %s", streamName, dummyID)
+		}
+
+		// Create the consumer group
+		err = q.CreateGroup(ctx, streamName, q.groupName)
+		if err != nil {
+			return fmt.Errorf("failed to create consumer group for %s: %w", taskType, err)
+		}
+
+		// Remove the dummy entry if we created one
+		if dummyID != "" {
+			err = q.redisClient.XDel(ctx, streamName, dummyID).Err()
+			if err != nil {
+				log.Warnf("⚠️ Failed to delete dummy entry from %s: %v", streamName, err)
+			} else {
+				log.Debugf("🗑️ Removed dummy entry from %s", streamName)
+			}
+		}
+
+		log.Infof("✅ Stream %s and consumer group %s ready", streamName, q.groupName)
+	}
+
+	log.Info("🎉 All Redis streams and consumer groups created successfully")
+	return nil
 }

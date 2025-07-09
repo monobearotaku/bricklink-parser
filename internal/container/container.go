@@ -105,6 +105,13 @@ func New(cfg *config.Config) (*Container, error) {
 
 // Run executes full parsing (existing behavior)
 func (c *Container) Run(ctx context.Context) error {
+	// Ensure all Redis streams and consumer groups exist before starting workers
+	log.Info("🔧 Ensuring Redis streams are ready before starting workers...")
+	err := c.Queue.EnsureStreamsExist(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to ensure Redis streams exist: %w", err)
+	}
+
 	g, ctx := errgroup.WithContext(ctx)
 
 	// Run ParseAll to enqueue tasks
