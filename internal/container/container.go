@@ -112,15 +112,23 @@ func (c *Container) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to ensure Redis streams exist: %w", err)
 	}
 
-	g, ctx := errgroup.WithContext(ctx)
+	var g errgroup.Group
 
-	// Run ParseAll to enqueue tasks
+	// Run ParseAll to enqueue tasks - uses original context
 	g.Go(func() error {
-		return c.Service.ParseAll(ctx)
+		log.Info("🚀 Starting ParseAll to enqueue initial catalog page tasks...")
+		err := c.Service.ParseAll(ctx)
+		if err != nil {
+			log.Errorf("❌ ParseAll failed: %v", err)
+			return fmt.Errorf("ParseAll failed: %w", err)
+		}
+		log.Info("✅ ParseAll completed successfully")
+		return nil
 	})
 
-	// Run workers to process tasks
+	// Run workers to process tasks - uses original context (won't be cancelled by ParseAll finishing)
 	g.Go(func() error {
+		log.Info("🚀 Starting workers to process all tasks...")
 		return c.Service.RunWorkers(ctx, c.Config.BrickLink.MaxWorkers)
 	})
 

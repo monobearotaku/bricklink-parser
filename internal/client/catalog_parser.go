@@ -170,6 +170,72 @@ func (p *catalogParser) extractItems(doc *goquery.Document, page *domain.Catalog
 	return page, nil
 }
 
+func (p *catalogParser) extractSubcategoryHierarchy(doc *goquery.Document) domain.SubcategoryHierarchy {
+	var subcategories []domain.SubcategoryInfo
+	var pathParts []string
+
+	// Look for the specific breadcrumb pattern in table cells
+	// The breadcrumb typically appears in a cell with background-color: #eeeeee
+	doc.Find("td[style*='background-color: #eeeeee'], td[bgcolor='#eeeeee']").Each(func(i int, td *goquery.Selection) {
+		text := strings.TrimSpace(td.Text())
+		// Must start with "Catalog:" and contain the item number at the end
+		if strings.HasPrefix(text, "Catalog:") && strings.Contains(text, ":") {
+			// Extract only the breadcrumb links, not all links in the cell
+			td.Find("a[href*='catalog.asp'], a[href*='catalogTree.asp'], a[href*='catalogList.asp']").Each(func(j int, link *goquery.Selection) {
+				href, exists := link.Attr("href")
+				name := strings.TrimSpace(link.Text())
+
+				if !exists || name == "" || name == "Catalog" {
+					return // Skip catalog root
+				}
+
+				// Only process actual category links, not action buttons
+				if strings.Contains(href, "catalog.asp") ||
+					strings.Contains(href, "catalogTree.asp") ||
+					strings.Contains(href, "catalogList.asp") {
+
+					// Extract ID from different URL patterns
+					var id string
+					if strings.Contains(href, "itemType=") {
+						// Pattern: catalogTree.asp?itemType=B
+						re := regexp.MustCompile(`itemType=([^&]+)`)
+						if matches := re.FindStringSubmatch(href); len(matches) > 1 {
+							id = matches[1]
+						}
+					} else if strings.Contains(href, "catString=") {
+						// Pattern: catalogList.asp?catType=B&catString=332.124.316
+						re := regexp.MustCompile(`catString=([^&]+)`)
+						if matches := re.FindStringSubmatch(href); len(matches) > 1 {
+							id = matches[1]
+						}
+					}
+
+					// Ensure URL is absolute
+					fullURL := href
+					if strings.HasPrefix(href, "//") {
+						fullURL = "https:" + href
+					} else if strings.HasPrefix(href, "/") {
+						fullURL = p.baseURL + href
+					}
+
+					subcategories = append(subcategories, domain.SubcategoryInfo{
+						Name: name,
+						URL:  fullURL,
+						ID:   id,
+					})
+					pathParts = append(pathParts, name)
+				}
+			})
+			return // Found the breadcrumb, stop searching
+		}
+	})
+
+	return domain.SubcategoryHierarchy{
+		FullPath:      strings.Join(pathParts, ": "),
+		Subcategories: subcategories,
+	}
+}
+
 func (p *catalogParser) ParseItemDetails(html, itemID string) (*domain.PartDetails, error) {
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
 	if err != nil {
@@ -179,14 +245,14 @@ func (p *catalogParser) ParseItemDetails(html, itemID string) (*domain.PartDetai
 	// Extract item name from h1 heading
 	name := strings.TrimSpace(doc.Find("h1").First().Text())
 
-	// Build category path from breadcrumbs
+	// Extract detailed subcategory hierarchy from breadcrumbs
+	subcategoryHierarchy := p.extractSubcategoryHierarchy(doc)
+
+	// Build legacy category path for backward compatibility
 	var categoryPath []string
-	doc.Find("a[href*='catalog.asp'], a[href*='catalogTree.asp'], a[href*='catalogList.asp']").Each(func(i int, s *goquery.Selection) {
-		text := strings.TrimSpace(s.Text())
-		if text != "" && text != ":" {
-			categoryPath = append(categoryPath, text)
-		}
-	})
+	for _, subcat := range subcategoryHierarchy.Subcategories {
+		categoryPath = append(categoryPath, subcat.Name)
+	}
 
 	// Parse item info using regex patterns
 	var year, weight, dimensions string
@@ -324,40 +390,42 @@ func (p *catalogParser) ParseItemDetails(html, itemID string) (*domain.PartDetai
 		colors = append(colors, colorInfo)
 	}
 
-	// Find "Item Appears In" - look for the cell containing this text, then find links
+	// Find "Item Appears In" - look for the strong tag with this text, then find links in same cell
 	var appearsIn []string
-	appearsInMap := make(map[string]bool) // To avoid duplicates
-	doc.Find("td").Each(func(i int, td *goquery.Selection) {
-		text := strings.TrimSpace(td.Text())
-		if strings.Contains(text, "Item Appears In") {
+	doc.Find("strong").Each(func(i int, strong *goquery.Selection) {
+		if strings.TrimSpace(strong.Text()) == "Item Appears In" {
+			// Found the "Item Appears In" header, look for links in the same cell
+			cell := strong.Parent()
 			// Find links in this cell that point to catalogItemIn.asp with in=S parameter
-			td.Find("a").Each(func(j int, a *goquery.Selection) {
+			cell.Find("a").Each(func(j int, a *goquery.Selection) {
 				href, exists := a.Attr("href")
 				if exists && strings.Contains(href, "catalogItemIn.asp") && strings.Contains(href, "in=S") {
-					appearsInMap[href] = true
+					if !strings.HasPrefix(href, "http") {
+						href = p.baseURL + href
+					}
+					appearsIn = append(appearsIn, href)
 				}
 			})
 		}
 	})
 
-	// Convert map to slice
-	for url := range appearsInMap {
-		appearsIn = append(appearsIn, url)
-	}
-
 	// Handle "Item Consists Of" - check for "N/A"
 	var consistsOf []string
-	doc.Find("td").Each(func(i int, td *goquery.Selection) {
-		text := strings.TrimSpace(td.Text())
-		if strings.Contains(text, "Item Consists Of") {
-			if strings.Contains(text, "N/A") {
+	doc.Find("strong").Each(func(i int, strong *goquery.Selection) {
+		if strings.TrimSpace(strong.Text()) == "Item Consists Of" {
+			// Found the "Item Consists Of" header, look for links in the same cell
+			cell := strong.Parent()
+			if strings.Contains(strings.TrimSpace(cell.Text()), "N/A") {
 				// Leave consistsOf empty when N/A
 				consistsOf = []string{}
 			} else {
-				// Look for actual links
-				td.Find("a").Each(func(j int, a *goquery.Selection) {
+				// Look for actual links in this specific cell only
+				cell.Find("a").Each(func(j int, a *goquery.Selection) {
 					href, exists := a.Attr("href")
-					if exists {
+					if exists && (strings.Contains(href, "catalogItemInv.asp") || strings.Contains(href, "invSet.asp")) {
+						if !strings.HasPrefix(href, "http") {
+							href = p.baseURL + href
+						}
 						consistsOf = append(consistsOf, href)
 					}
 				})
@@ -377,15 +445,16 @@ func (p *catalogParser) ParseItemDetails(html, itemID string) (*domain.PartDetai
 	})
 
 	return &domain.PartDetails{
-		ItemNumber:   itemID,
-		ItemName:     name,
-		FullCategory: strings.Join(categoryPath, ": "),
-		YearReleased: year,
-		Weight:       weight,
-		Dimensions:   dimensions,
-		Colors:       colors,
-		AppearsIn:    appearsIn,
-		ConsistsOf:   consistsOf,
+		ItemNumber:           itemID,
+		ItemName:             name,
+		FullCategory:         strings.Join(categoryPath, ": "),
+		YearReleased:         year,
+		Weight:               weight,
+		Dimensions:           dimensions,
+		Colors:               colors,
+		AppearsIn:            appearsIn,
+		ConsistsOf:           consistsOf,
+		SubcategoryHierarchy: subcategoryHierarchy,
 		ItemImageURL: func() string {
 			if len(imageURLs) > 0 {
 				return imageURLs[0]
