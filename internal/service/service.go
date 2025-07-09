@@ -125,8 +125,17 @@ func (s *Service) ParseAll(ctx context.Context) error {
 
 func (s *Service) RunWorkers(ctx context.Context, numWorkers int) error {
 	var wg sync.WaitGroup
-	streamName := "bricklink:stream:CatalogPageTask"
 
+	// Run workers for both regular and retry tasks
+	s.runWorkersForStream(ctx, &wg, numWorkers, "bricklink:stream:CatalogPageTask", "main")
+	s.runWorkersForStream(ctx, &wg, numWorkers/2, "bricklink:stream:PageRetryTask", "retry")
+
+	wg.Wait()
+	return nil
+}
+
+func (s *Service) runWorkersForStream(ctx context.Context, wg *sync.WaitGroup, numWorkers int, streamName, workerType string) {
+	// Auto-claimer for this stream
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -137,14 +146,14 @@ func (s *Service) RunWorkers(ctx context.Context, numWorkers int) error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				consumer := fmt.Sprintf("autoclaimer-%d", time.Now().UnixNano())
+				consumer := fmt.Sprintf("autoclaimer-%s-%d", workerType, time.Now().UnixNano())
 				claimedMessages, err := s.queue.AutoClaim(ctx, s.groupName, consumer, streamName, s.minIdleTime)
 				if err != nil {
-					log.Errorf("❌ Failed to auto-claim messages: %v", err)
+					log.Errorf("❌ Failed to auto-claim messages for %s: %v", streamName, err)
 					continue
 				}
 				if len(claimedMessages) > 0 {
-					log.Infof("🔄 Auto-claimed %d messages", len(claimedMessages))
+					log.Infof("🔄 Auto-claimed %d messages from %s stream", len(claimedMessages), workerType)
 					for _, msg := range claimedMessages {
 						err := s.processMessage(ctx, &msg)
 						if err != nil {
@@ -156,21 +165,22 @@ func (s *Service) RunWorkers(ctx context.Context, numWorkers int) error {
 		}
 	}()
 
+	// Regular workers for this stream
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			consumer := fmt.Sprintf("worker-%d", workerID)
-			log.Infof("🚀 Starting worker %d as consumer %s", workerID, consumer)
+			consumer := fmt.Sprintf("%s-worker-%d", workerType, workerID)
+			log.Infof("🚀 Starting %s worker %d as consumer %s", workerType, workerID, consumer)
 			for {
 				select {
 				case <-ctx.Done():
-					log.Infof("🛑 Worker %d stopping", workerID)
+					log.Infof("🛑 %s worker %d stopping", workerType, workerID)
 					return
 				default:
 					msg, err := s.queue.GetTask(ctx, s.groupName, consumer, streamName)
 					if err != nil {
-						log.Errorf("❌ Failed to get task: %v", err)
+						log.Errorf("❌ Failed to get task from %s: %v", streamName, err)
 						continue
 					}
 
@@ -184,26 +194,60 @@ func (s *Service) RunWorkers(ctx context.Context, numWorkers int) error {
 			}
 		}(i + 1)
 	}
-	wg.Wait()
-	return nil
 }
 
 func (s *Service) processMessage(ctx context.Context, msg *redis.XMessage) error {
+	taskType, ok := msg.Values["task_type"].(string)
+	if !ok {
+		return fmt.Errorf("invalid task type in message %s", msg.ID)
+	}
+
 	taskData, ok := msg.Values["task_data"].(string)
 	if !ok {
 		return fmt.Errorf("invalid task data in message %s", msg.ID)
 	}
 
-	pageTask, err := task.UnmarshalTask[*task.CatalogPageTask]([]byte(taskData))
-	if err != nil {
-		return fmt.Errorf("failed to unmarshal task data: %w", err)
+	var streamName string
+	switch taskType {
+	case "CatalogPageTask":
+		streamName = "bricklink:stream:CatalogPageTask"
+		pageTask, err := task.UnmarshalTask[*task.CatalogPageTask]([]byte(taskData))
+		if err != nil {
+			return fmt.Errorf("failed to unmarshal catalog page task data: %w", err)
+		}
+
+		if err := s.parsePage(ctx, pageTask); err != nil {
+			// Add to retry queue instead of failing completely
+			retryTask := &task.PageRetryTask{
+				PageNumber:   pageTask.PageNumber,
+				CategoryType: pageTask.CategoryType,
+				RetryCount:   0,
+				Error:        err.Error(),
+			}
+
+			if _, addErr := s.queue.AddTask(ctx, retryTask); addErr != nil {
+				log.Errorf("❌ Failed to add retry task for page %d: %v", pageTask.PageNumber, addErr)
+			} else {
+				log.Warnf("🔄 Added page %d to retry queue due to error: %v", pageTask.PageNumber, err)
+			}
+		}
+
+	case "PageRetryTask":
+		streamName = "bricklink:stream:PageRetryTask"
+		retryTask, err := task.UnmarshalTask[*task.PageRetryTask]([]byte(taskData))
+		if err != nil {
+			return fmt.Errorf("failed to unmarshal retry task data: %w", err)
+		}
+
+		if err := s.retryPage(ctx, retryTask); err != nil {
+			return fmt.Errorf("failed to retry page: %w", err)
+		}
+
+	default:
+		return fmt.Errorf("unknown task type: %s", taskType)
 	}
 
-	if err := s.parsePage(ctx, pageTask); err != nil {
-		return fmt.Errorf("failed to parse page: %w", err)
-	}
-
-	if err := s.queue.AckTask(ctx, "bricklink:stream:CatalogPageTask", s.groupName, msg.ID); err != nil {
+	if err := s.queue.AckTask(ctx, streamName, s.groupName, msg.ID); err != nil {
 		return fmt.Errorf("failed to ack message %s: %w", msg.ID, err)
 	}
 
@@ -231,6 +275,51 @@ func (s *Service) parsePage(ctx context.Context, pageTask *task.CatalogPageTask)
 		}
 	}
 
+	return nil
+}
+
+func (s *Service) retryPage(ctx context.Context, retryTask *task.PageRetryTask) error {
+	// Increment retry count
+	retryTask.RetryCount++
+
+	log.Infof("🔄 Retrying page %d for %s (attempt %d)",
+		retryTask.PageNumber, retryTask.CategoryType, retryTask.RetryCount)
+
+	// Try to fetch the page again
+	page, err := s.client.GetCatalogPage(ctx, retryTask.CategoryType, retryTask.PageNumber)
+	if err != nil {
+		// Create new retry task with incremented count - retry indefinitely
+		newRetryTask := &task.PageRetryTask{
+			PageNumber:   retryTask.PageNumber,
+			CategoryType: retryTask.CategoryType,
+			RetryCount:   retryTask.RetryCount,
+			Error:        err.Error(),
+		}
+
+		if _, addErr := s.queue.AddTask(ctx, newRetryTask); addErr != nil {
+			log.Errorf("❌ Failed to re-add retry task for page %d: %v", retryTask.PageNumber, addErr)
+			return addErr
+		}
+
+		log.Warnf("🔄 Page %d for %s failed again, will retry (attempt %d): %v",
+			retryTask.PageNumber, retryTask.CategoryType, retryTask.RetryCount, err)
+		return nil
+	}
+
+	// Success! Create a regular CatalogPageTask to process the items
+	pageTask := &task.CatalogPageTask{
+		PageNumber:   page.PageNumber,
+		CategoryType: page.CategoryType,
+		Items:        page.Items,
+	}
+
+	if _, err := s.queue.AddTask(ctx, pageTask); err != nil {
+		log.Errorf("❌ Failed to add recovered page task for page %d: %v", retryTask.PageNumber, err)
+		return err
+	}
+
+	log.Infof("✅ Successfully recovered page %d for %s after %d attempts",
+		retryTask.PageNumber, retryTask.CategoryType, retryTask.RetryCount)
 	return nil
 }
 

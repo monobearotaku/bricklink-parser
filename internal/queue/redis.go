@@ -32,10 +32,14 @@ func NewRedisQueue(redisClient *redis.Client, cfg config.RedisConfig) (Queue, er
 		groupName:    cfg.ConsumerGroup,
 	}
 
-	streamName := q.streamPrefix + "CatalogPageTask"
-	err := q.CreateGroup(context.Background(), streamName, q.groupName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create consumer group: %w", err)
+	// Create consumer groups for all task types
+	taskTypes := []string{"CatalogPageTask", "PageRetryTask"}
+	for _, taskType := range taskTypes {
+		streamName := q.streamPrefix + taskType
+		err := q.CreateGroup(context.Background(), streamName, q.groupName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create consumer group for %s: %w", taskType, err)
+		}
 	}
 
 	return q, nil

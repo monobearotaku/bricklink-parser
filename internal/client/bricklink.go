@@ -22,6 +22,7 @@ import (
 type BrickLinkClient interface {
 	GetAllCatalogPages(ctx context.Context, categoryType domain.CategoryType) (*domain.CatalogResults, error)
 	GetAllCatalogPagesCh(ctx context.Context, categoryType domain.CategoryType, startPage int) (*domain.CatalogResults, chan *domain.CatalogPage, error)
+	GetCatalogPage(ctx context.Context, categoryType domain.CategoryType, pageNumber int) (*domain.CatalogPage, error)
 	GetItemDetails(ctx context.Context, itemType domain.CategoryType, itemID string) (*domain.PartDetails, error)
 }
 
