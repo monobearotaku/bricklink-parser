@@ -31,10 +31,8 @@ type BrickLinkConfig struct {
 	Proxies              []string `mapstructure:"proxies"`
 
 	// Authentication
-	Username     string `mapstructure:"username"`
-	Password     string `mapstructure:"password"`
-	CookieFile   string `mapstructure:"cookie_file"`
-	LoginOnStart bool   `mapstructure:"login_on_start"`
+	Username string `mapstructure:"username"`
+	Password string `mapstructure:"password"`
 }
 
 // DatabaseConfig holds database configuration

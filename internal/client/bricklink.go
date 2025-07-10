@@ -64,14 +64,15 @@ func NewBrickLinkClient(cfg config.BrickLinkConfig, queue queue.Queue) BrickLink
 		circuitBreakerDelay: 30 * time.Minute,
 	}
 
-	// Login immediately if credentials are provided
-	if cfg.LoginOnStart && cfg.Username != "" && cfg.Password != "" {
+	if cfg.Username != "" && cfg.Password != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
 		if err := brickClient.Login(ctx, cfg.Username, cfg.Password); err != nil {
 			log.Errorf("❌ Failed to login during client initialization: %v", err)
 		}
+
+		log.Infof("✅ Successfully logged in to BrickLink as %s", cfg.Username)
 	}
 
 	return brickClient
