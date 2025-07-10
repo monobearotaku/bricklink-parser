@@ -4,13 +4,13 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"net/http/cookiejar"
 	"strings"
 	"sync"
 	"time"
 
 	"bricklink/parser/internal/config"
 	"bricklink/parser/internal/domain"
-	"bricklink/parser/internal/domain/task"
 	"bricklink/parser/internal/queue"
 
 	"sync/atomic"
@@ -39,20 +39,24 @@ type brickLinkClient struct {
 	circuitBreakerMutex sync.RWMutex
 	quotaExceededUntil  time.Time
 	circuitBreakerDelay time.Duration
+	jar                 *cookiejar.Jar
 }
 
 func NewBrickLinkClient(cfg config.BrickLinkConfig, queue queue.Queue) BrickLinkClient {
+	jar, _ := cookiejar.New(nil)
+
 	client := resty.New().
 		SetTimeout(60*time.Second).
 		SetRetryCount(3).
 		SetRetryWaitTime(2*time.Second).
 		SetRetryMaxWaitTime(10*time.Second).
-		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36").
+		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36 OPR/119.0.0.0 (Edition std-2)").
 		SetHeader("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8").
 		SetHeader("Accept-Language", "en-US,en;q=0.5").
 		SetTLSClientConfig(&tls.Config{
 			InsecureSkipVerify: true,
-		})
+		}).
+		SetCookieJar(jar)
 
 	brickClient := &brickLinkClient{
 		rl:                  ratelimit.New(cfg.MaxRequestsPerSecond),
@@ -61,7 +65,8 @@ func NewBrickLinkClient(cfg config.BrickLinkConfig, queue queue.Queue) BrickLink
 		httpClient:          client,
 		parser:              newCatalogParser(cfg.BaseURL),
 		queue:               queue,
-		circuitBreakerDelay: 30 * time.Minute,
+		circuitBreakerDelay: 5 * time.Minute,
+		jar:                 jar,
 	}
 
 	if cfg.Username != "" && cfg.Password != "" {
@@ -129,23 +134,7 @@ func (c *brickLinkClient) GetAllCatalogPages(ctx context.Context, categoryType d
 
 				page, err := c.GetCatalogPage(ctx, categoryType, pageNum)
 				if err != nil {
-					// Add to retry queue instead of just logging
-					retryTask := &task.PageRetryTask{
-						PageNumber:   pageNum,
-						CategoryType: categoryType,
-						RetryCount:   0,
-						Error:        err.Error(),
-					}
-
-					if c.queue != nil {
-						if _, addErr := c.queue.AddTask(ctx, retryTask); addErr != nil {
-							log.Errorf("❌ Failed to add page %d to retry queue: %v", pageNum, addErr)
-						} else {
-							log.Warnf("🔄 Added page %d to retry queue due to fetch failure: %v", pageNum, err)
-						}
-					} else {
-						log.Errorf("Failed to fetch page %d: %v", pageNum, err)
-					}
+					log.Errorf("Failed to fetch page %d: %v", pageNum, err)
 					return
 				}
 
@@ -201,23 +190,7 @@ func (c *brickLinkClient) GetAllCatalogPagesCh(ctx context.Context, categoryType
 
 					page, err := c.GetCatalogPage(ctx, categoryType, pageNum)
 					if err != nil {
-						// Add to retry queue instead of just logging
-						retryTask := &task.PageRetryTask{
-							PageNumber:   pageNum,
-							CategoryType: categoryType,
-							RetryCount:   0,
-							Error:        err.Error(),
-						}
-
-						if c.queue != nil {
-							if _, addErr := c.queue.AddTask(ctx, retryTask); addErr != nil {
-								log.Errorf("❌ Failed to add page %d to retry queue: %v", pageNum, addErr)
-							} else {
-								log.Warnf("🔄 Added page %d to retry queue due to fetch failure: %v", pageNum, err)
-							}
-						} else {
-							log.Errorf("Failed to fetch page %d: %v", pageNum, err)
-						}
+						log.Errorf("Failed to fetch page %d: %v", pageNum, err)
 						<-semaphore
 						return
 					}
@@ -300,34 +273,54 @@ func (c *brickLinkClient) getRemainingCircuitBreakerTime() time.Duration {
 }
 
 func (c *brickLinkClient) Login(ctx context.Context, username, password string) error {
-	mainPageURL := c.baseURL + "/"
+	// First, get the main page to establish session and get cookies
+	mainPageURL := c.baseURL + "/v2/main.page"
+
+	log.Infof("🔐 Getting main page to establish session: %s", mainPageURL)
 
 	resp, err := c.httpClient.R().
 		SetContext(ctx).
+		SetHeader("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8").
+		SetHeader("Accept-Language", "en-US,en;q=0.5").
+		SetHeader("Accept-Encoding", "gzip, deflate, br").
+		SetHeader("DNT", "1").
+		SetHeader("Connection", "keep-alive").
+		SetHeader("Upgrade-Insecure-Requests", "1").
 		Get(mainPageURL)
 
 	if err != nil {
-		return fmt.Errorf("failed to get main page: %w", err)
+		log.Fatalf("❌ Failed to get main page: %v", err)
 	}
 
 	if resp.IsError() {
-		return fmt.Errorf("main page returned error: %d %s", resp.StatusCode(), resp.Status())
+		log.Fatalf("❌ Main page returned error: %d %s\n📄 Response: %s", resp.StatusCode(), resp.Status(), resp.String())
 	}
 
-	pageContent := resp.String()
+	// Extract mid from blckMID cookie
 	mid := ""
-
-	if strings.Contains(pageContent, "mid=") {
-		start := strings.Index(pageContent, "mid=")
-		if start != -1 {
-			start += 4 // Skip "mid="
-			end := strings.IndexAny(pageContent[start:], "&\"' \n\r\t")
-			if end != -1 {
-				mid = pageContent[start : start+end]
-			}
+	cookies := resp.Cookies()
+	log.Infof("📋 Received %d cookies from main page", len(cookies))
+	for _, cookie := range cookies {
+		log.Debugf("📋 Cookie: %s=%s", cookie.Name, cookie.Value)
+		if cookie.Name == "blckMID" {
+			mid = cookie.Value
+			log.Infof("✅ Found blckMID cookie: %s", mid)
+			break
 		}
 	}
 
+	if mid == "197e5d7ad2b00000-d6a8561f3fad0af7" {
+		// List all cookie names for debugging
+		cookieNames := make([]string, len(cookies))
+		for i, cookie := range cookies {
+			cookieNames[i] = cookie.Name
+		}
+		log.Warnf("⚠️ blckMID cookie not found. Available cookies: %v", cookieNames)
+		log.Infof("🔄 Attempting login with empty mid parameter...")
+		mid = "" // Use empty string for mid
+	}
+
+	// Now attempt login using the AJAX endpoint
 	loginURL := c.baseURL + "/ajax/renovate/loginandout.ajax"
 
 	loginData := map[string]string{
@@ -337,46 +330,68 @@ func (c *brickLinkClient) Login(ctx context.Context, username, password string) 
 		"keepme_loggedin": "false",
 		"impersonate":     "false",
 		"mid":             mid,
-		"pageid":          "MAIN",
+		"pageid":          "CATALOG_VIEW",
 		"login_to":        "",
 	}
+
+	log.Infof("🔐 Attempting login to: %s", loginURL)
+	log.Infof("📋 Form Data: userid=%s, password=[HIDDEN], override=false, keepme_loggedin=false, impersonate=false, mid=%s, pageid=CATALOG_VIEW, login_to=", username, mid)
 
 	loginResp, err := c.httpClient.R().
 		SetContext(ctx).
 		SetFormData(loginData).
-		SetHeader("Referer", c.baseURL+"/").
+		SetHeader("Accept", "application/json, text/javascript, */*; q=0.01").
+		SetHeader("Accept-Language", "en-US,en;q=0.5").
+		SetHeader("Accept-Encoding", "gzip, deflate, br").
+		SetHeader("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8").
 		SetHeader("X-Requested-With", "XMLHttpRequest").
-		SetHeader("Content-Type", "application/x-www-form-urlencoded").
+		SetHeader("Origin", c.baseURL).
+		SetHeader("DNT", "1").
+		SetHeader("Connection", "keep-alive").
+		SetHeader("Referer", mainPageURL).
+		SetHeader("Sec-Fetch-Dest", "empty").
+		SetHeader("Sec-Fetch-Mode", "cors").
+		SetHeader("Sec-Fetch-Site", "same-origin").
 		Post(loginURL)
 
 	if err != nil {
-		return fmt.Errorf("login request failed: %w", err)
-	}
-
-	if loginResp.IsError() {
-		return fmt.Errorf("login failed with HTTP error: %d %s", loginResp.StatusCode(), loginResp.Status())
+		log.Fatalf("❌ Login request failed: %v", err)
 	}
 
 	responseBody := loginResp.String()
+	log.Infof("📄 Login Response Status: %d %s", loginResp.StatusCode(), loginResp.Status())
+	log.Infof("📄 Full Login Response: %s", responseBody)
 
+	if loginResp.IsError() {
+		log.Fatalf("❌ Login failed with HTTP error: %d %s\n📄 Full Response: %s", loginResp.StatusCode(), loginResp.Status(), responseBody)
+	}
+
+	// Check for successful login
 	if strings.Contains(responseBody, `"returnCode":0`) ||
 		strings.Contains(responseBody, `"returnCode": 0`) {
 		log.Infof("✅ Successfully logged in to BrickLink as %s", username)
 		return nil
 	}
 
+	// Check for specific error conditions
 	if strings.Contains(responseBody, "Invalid User ID") ||
 		strings.Contains(responseBody, "Invalid Password") ||
 		strings.Contains(responseBody, `"returnCode":-1`) {
-		return fmt.Errorf("login failed: invalid credentials")
+		log.Fatalf("❌ Login failed: invalid credentials\n📋 Request URL: %s\n📋 Form Data: %+v\n📄 Full Response: %s", loginURL, loginData, responseBody)
 	}
 
-	if strings.Contains(responseBody, "Invalid Method") {
-		return fmt.Errorf("login failed: invalid method - may need additional parameters")
+	if strings.Contains(responseBody, "Invalid Method") ||
+		strings.Contains(responseBody, `"returnCode":-2`) {
+		log.Fatalf("❌ Login failed: invalid method/parameters\n📋 Request URL: %s\n📋 Form Data: %+v\n📄 Full Response: %s", loginURL, loginData, responseBody)
 	}
 
-	log.Warnf("⚠️ Login response: %s", responseBody)
-	return fmt.Errorf("login failed: unexpected response")
+	if strings.Contains(responseBody, "different device") ||
+		strings.Contains(responseBody, "Please log in from a different device") {
+		log.Fatalf("❌ Login failed: BrickLink detected automation/bot behavior\n💡 Try using different user agent, headers, or run from a different IP\n📋 Request URL: %s\n📋 Form Data: %+v\n📄 Full Response: %s", loginURL, loginData, responseBody)
+	}
+
+	log.Fatalf("❌ Login failed: unexpected response\n📋 Request URL: %s\n📋 Form Data: %+v\n📄 Full Response: %s", loginURL, loginData, responseBody)
+	return nil // This line will never be reached due to log.Fatalf
 }
 
 func (c *brickLinkClient) fetchHTML(ctx context.Context, url string) (string, error) {

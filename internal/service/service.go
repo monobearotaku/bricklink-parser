@@ -222,7 +222,6 @@ func (s *Service) processMessage(ctx context.Context, msg *redis.XMessage) error
 			retryTask := &task.PageRetryTask{
 				PageNumber:   pageTask.PageNumber,
 				CategoryType: pageTask.CategoryType,
-				RetryCount:   0,
 				Error:        err.Error(),
 			}
 
@@ -281,7 +280,6 @@ func (s *Service) parsePage(ctx context.Context, pageTask *task.CatalogPageTask)
 				ItemURL:      item.ItemURL,
 				ItemType:     itemType,
 				ItemID:       itemID,
-				RetryCount:   0,
 				Error:        err.Error(),
 				FailureStage: "fetch",
 			}
@@ -301,7 +299,6 @@ func (s *Service) parsePage(ctx context.Context, pageTask *task.CatalogPageTask)
 				ItemURL:      item.ItemURL,
 				ItemType:     itemType,
 				ItemID:       itemID,
-				RetryCount:   0,
 				Error:        err.Error(),
 				FailureStage: "save",
 			}
@@ -321,26 +318,12 @@ func (s *Service) parsePage(ctx context.Context, pageTask *task.CatalogPageTask)
 }
 
 func (s *Service) retryPage(ctx context.Context, retryTask *task.PageRetryTask) error {
-	// Increment retry count
-	retryTask.RetryCount++
-
 	// Try to fetch the page again
 	page, err := s.client.GetCatalogPage(ctx, retryTask.CategoryType, retryTask.PageNumber)
 	if err != nil {
-		// Create new retry task with incremented count - retry indefinitely
-		newRetryTask := &task.PageRetryTask{
-			PageNumber:   retryTask.PageNumber,
-			CategoryType: retryTask.CategoryType,
-			RetryCount:   retryTask.RetryCount,
-			Error:        err.Error(),
-		}
-
-		if _, addErr := s.queue.AddTask(ctx, newRetryTask); addErr != nil {
-			log.Errorf("❌ Failed to re-add retry task for page %d: %v", retryTask.PageNumber, addErr)
-			return addErr
-		}
-
-		return nil
+		// Log the failure but don't re-add to retry queue
+		log.Errorf("❌ Final retry failed for page %d (%s): %v", retryTask.PageNumber, retryTask.CategoryType, err)
+		return nil // Return nil to acknowledge the task as processed
 	}
 
 	// Success! Create a regular CatalogPageTask to process the items
@@ -355,113 +338,51 @@ func (s *Service) retryPage(ctx context.Context, retryTask *task.PageRetryTask) 
 		return err
 	}
 
-	log.Infof("✅ Successfully recovered page %d for %s after %d attempts",
-		retryTask.PageNumber, retryTask.CategoryType, retryTask.RetryCount)
+	log.Infof("✅ Successfully recovered page %d for %s on retry",
+		retryTask.PageNumber, retryTask.CategoryType)
 	return nil
 }
 
 func (s *Service) retryItem(ctx context.Context, itemRetryTask *task.ItemRetryTask) error {
-	itemRetryTask.RetryCount++
-
 	switch itemRetryTask.FailureStage {
 	case "fetch":
 		// Retry fetching item details
 		details, err := s.client.GetItemDetails(ctx, itemRetryTask.ItemType, itemRetryTask.ItemID)
 		if err != nil {
-			// Re-queue for another fetch retry
-			newRetryTask := &task.ItemRetryTask{
-				ItemURL:      itemRetryTask.ItemURL,
-				ItemType:     itemRetryTask.ItemType,
-				ItemID:       itemRetryTask.ItemID,
-				RetryCount:   itemRetryTask.RetryCount,
-				Error:        err.Error(),
-				FailureStage: "fetch",
-			}
-
-			if _, addErr := s.queue.AddTask(ctx, newRetryTask); addErr != nil {
-				log.Errorf("❌ Failed to re-add item fetch retry task for %s: %v", itemRetryTask.ItemID, addErr)
-				return addErr
-			}
-
-			return nil
+			// Log the failure but don't re-add to retry queue
+			log.Errorf("❌ Final retry failed for item %s (fetch): %v", itemRetryTask.ItemID, err)
+			return nil // Return nil to acknowledge the task as processed
 		}
 
 		// Fetch succeeded, now try to save
 		err = s.repository.SavePartDetails(ctx, itemRetryTask.ItemType, details)
 		if err != nil {
-			// Re-queue for save retry
-			newRetryTask := &task.ItemRetryTask{
-				ItemURL:      itemRetryTask.ItemURL,
-				ItemType:     itemRetryTask.ItemType,
-				ItemID:       itemRetryTask.ItemID,
-				RetryCount:   itemRetryTask.RetryCount,
-				Error:        err.Error(),
-				FailureStage: "save",
-			}
-
-			if _, addErr := s.queue.AddTask(ctx, newRetryTask); addErr != nil {
-				log.Errorf("❌ Failed to re-add item save retry task for %s: %v", itemRetryTask.ItemID, addErr)
-				return addErr
-			}
-
-			log.Warnf("🔄 Item %s save failed, will retry (attempt %d): %v",
-				itemRetryTask.ItemID, itemRetryTask.RetryCount, err)
-			return nil
+			// Log the failure but don't re-add to retry queue
+			log.Errorf("❌ Final retry failed for item %s (save after fetch): %v", itemRetryTask.ItemID, err)
+			return nil // Return nil to acknowledge the task as processed
 		}
 
-		log.Infof("✅ Successfully processed item %s after %d attempts",
-			itemRetryTask.ItemID, itemRetryTask.RetryCount)
+		log.Infof("✅ Successfully processed item %s on retry", itemRetryTask.ItemID)
 
 	case "save":
 		// We already have the details, just retry saving
 		// Note: We don't store the details in the retry task, so we need to fetch again
 		details, err := s.client.GetItemDetails(ctx, itemRetryTask.ItemType, itemRetryTask.ItemID)
 		if err != nil {
-			// If fetch fails now, convert to fetch retry
-			newRetryTask := &task.ItemRetryTask{
-				ItemURL:      itemRetryTask.ItemURL,
-				ItemType:     itemRetryTask.ItemType,
-				ItemID:       itemRetryTask.ItemID,
-				RetryCount:   itemRetryTask.RetryCount,
-				Error:        err.Error(),
-				FailureStage: "fetch",
-			}
-
-			if _, addErr := s.queue.AddTask(ctx, newRetryTask); addErr != nil {
-				log.Errorf("❌ Failed to re-add item fetch retry task for %s: %v", itemRetryTask.ItemID, addErr)
-				return addErr
-			}
-
-			log.Warnf("🔄 Item %s re-fetch failed during save retry, will retry fetch (attempt %d): %v",
-				itemRetryTask.ItemID, itemRetryTask.RetryCount, err)
-			return nil
+			// Log the failure but don't re-add to retry queue
+			log.Errorf("❌ Final retry failed for item %s (refetch for save): %v", itemRetryTask.ItemID, err)
+			return nil // Return nil to acknowledge the task as processed
 		}
 
 		// Try to save again
 		err = s.repository.SavePartDetails(ctx, itemRetryTask.ItemType, details)
 		if err != nil {
-			// Re-queue for another save retry
-			newRetryTask := &task.ItemRetryTask{
-				ItemURL:      itemRetryTask.ItemURL,
-				ItemType:     itemRetryTask.ItemType,
-				ItemID:       itemRetryTask.ItemID,
-				RetryCount:   itemRetryTask.RetryCount,
-				Error:        err.Error(),
-				FailureStage: "save",
-			}
-
-			if _, addErr := s.queue.AddTask(ctx, newRetryTask); addErr != nil {
-				log.Errorf("❌ Failed to re-add item save retry task for %s: %v", itemRetryTask.ItemID, addErr)
-				return addErr
-			}
-
-			log.Warnf("🔄 Item %s save failed again, will retry (attempt %d): %v",
-				itemRetryTask.ItemID, itemRetryTask.RetryCount, err)
-			return nil
+			// Log the failure but don't re-add to retry queue
+			log.Errorf("❌ Final retry failed for item %s (save): %v", itemRetryTask.ItemID, err)
+			return nil // Return nil to acknowledge the task as processed
 		}
 
-		log.Infof("✅ Successfully saved item %s after %d attempts",
-			itemRetryTask.ItemID, itemRetryTask.RetryCount)
+		log.Infof("✅ Successfully saved item %s on retry", itemRetryTask.ItemID)
 
 	default:
 		return fmt.Errorf("unknown failure stage: %s", itemRetryTask.FailureStage)
