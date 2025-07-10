@@ -11,7 +11,8 @@ bricklink:
   max_retries: 5
   max_workers: 5
   max_requests_per_second: 5
-  proxies:
+  username: ""
+  password: ""
     
 database:
   host: localhost

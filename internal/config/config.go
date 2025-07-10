@@ -29,6 +29,12 @@ type BrickLinkConfig struct {
 	MaxWorkers           int      `mapstructure:"max_workers"`
 	MaxRequestsPerSecond int      `mapstructure:"max_requests_per_second"`
 	Proxies              []string `mapstructure:"proxies"`
+
+	// Authentication
+	Username     string `mapstructure:"username"`
+	Password     string `mapstructure:"password"`
+	CookieFile   string `mapstructure:"cookie_file"`
+	LoginOnStart bool   `mapstructure:"login_on_start"`
 }
 
 // DatabaseConfig holds database configuration
@@ -88,6 +94,10 @@ func setDefaults() {
 	viper.SetDefault("bricklink.timeout", 30)
 	viper.SetDefault("bricklink.max_retries", 3)
 	viper.SetDefault("bricklink.max_workers", 10)
+	viper.SetDefault("bricklink.username", "")
+	viper.SetDefault("bricklink.password", "")
+	viper.SetDefault("bricklink.cookie_file", "./cookies.json")
+	viper.SetDefault("bricklink.login_on_start", true)
 
 	viper.SetDefault("database.host", "localhost")
 	viper.SetDefault("database.port", 5432)

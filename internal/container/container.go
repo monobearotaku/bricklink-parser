@@ -8,7 +8,6 @@ import (
 
 	"bricklink/parser/internal/client"
 	"bricklink/parser/internal/config"
-	"bricklink/parser/internal/proxy"
 	"bricklink/parser/internal/queue"
 	"bricklink/parser/internal/repository"
 	"bricklink/parser/internal/service"
@@ -37,12 +36,6 @@ type Container struct {
 func New(cfg *config.Config) (*Container, error) {
 	container := &Container{
 		Config: cfg,
-	}
-
-	// Initialize ProxySupplier
-	proxySupplier, err := proxy.NewProxySupplier(context.Background(), cfg.BrickLink.Proxies, cfg.BrickLink.BaseURL)
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize proxy supplier: %w", err)
 	}
 
 	// Initialize repository
@@ -86,7 +79,7 @@ func New(cfg *config.Config) (*Container, error) {
 	container.StateManager = stateManager
 
 	// Initialize client with queue (after queue is created)
-	brickLinkClient := client.NewBrickLinkClient(cfg.BrickLink, proxySupplier, redisQueue)
+	brickLinkClient := client.NewBrickLinkClient(cfg.BrickLink, redisQueue)
 	container.Client = brickLinkClient
 
 	service := service.NewService(

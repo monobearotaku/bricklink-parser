@@ -11,7 +11,6 @@ import (
 	"bricklink/parser/internal/config"
 	"bricklink/parser/internal/domain"
 	"bricklink/parser/internal/domain/task"
-	"bricklink/parser/internal/proxy"
 	"bricklink/parser/internal/queue"
 
 	"sync/atomic"
@@ -29,13 +28,12 @@ type BrickLinkClient interface {
 }
 
 type brickLinkClient struct {
-	rl            ratelimit.Limiter
-	config        config.BrickLinkConfig
-	baseURL       string
-	httpClient    *resty.Client
-	parser        *catalogParser
-	proxySupplier proxy.ProxySupplier
-	queue         queue.Queue
+	rl         ratelimit.Limiter
+	config     config.BrickLinkConfig
+	baseURL    string
+	httpClient *resty.Client
+	parser     *catalogParser
+	queue      queue.Queue
 
 	// Circuit breaker for quota exceeded
 	circuitBreakerMutex sync.RWMutex
@@ -43,7 +41,7 @@ type brickLinkClient struct {
 	circuitBreakerDelay time.Duration
 }
 
-func NewBrickLinkClient(cfg config.BrickLinkConfig, proxySupplier proxy.ProxySupplier, queue queue.Queue) BrickLinkClient {
+func NewBrickLinkClient(cfg config.BrickLinkConfig, queue queue.Queue) BrickLinkClient {
 	client := resty.New().
 		SetTimeout(60*time.Second).
 		SetRetryCount(3).
@@ -56,24 +54,27 @@ func NewBrickLinkClient(cfg config.BrickLinkConfig, proxySupplier proxy.ProxySup
 			InsecureSkipVerify: true,
 		})
 
-	// Get initial proxy
-	if proxySupplier != nil {
-		if proxyURL := proxySupplier.Get(); proxyURL != "" {
-			client.SetProxy(proxyURL)
-			log.Infof("🔗 Using initial proxy: %s", proxyURL)
-		}
-	}
-
-	return &brickLinkClient{
+	brickClient := &brickLinkClient{
 		rl:                  ratelimit.New(cfg.MaxRequestsPerSecond),
 		config:              cfg,
 		baseURL:             cfg.BaseURL,
 		httpClient:          client,
 		parser:              newCatalogParser(cfg.BaseURL),
-		proxySupplier:       proxySupplier,
 		queue:               queue,
 		circuitBreakerDelay: 30 * time.Minute,
 	}
+
+	// Login immediately if credentials are provided
+	if cfg.LoginOnStart && cfg.Username != "" && cfg.Password != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		if err := brickClient.Login(ctx, cfg.Username, cfg.Password); err != nil {
+			log.Errorf("❌ Failed to login during client initialization: %v", err)
+		}
+	}
+
+	return brickClient
 }
 
 func (c *brickLinkClient) GetCatalogPage(ctx context.Context, categoryType domain.CategoryType, pageNumber int) (*domain.CatalogPage, error) {
@@ -297,6 +298,86 @@ func (c *brickLinkClient) getRemainingCircuitBreakerTime() time.Duration {
 	return remaining
 }
 
+func (c *brickLinkClient) Login(ctx context.Context, username, password string) error {
+	mainPageURL := c.baseURL + "/"
+
+	resp, err := c.httpClient.R().
+		SetContext(ctx).
+		Get(mainPageURL)
+
+	if err != nil {
+		return fmt.Errorf("failed to get main page: %w", err)
+	}
+
+	if resp.IsError() {
+		return fmt.Errorf("main page returned error: %d %s", resp.StatusCode(), resp.Status())
+	}
+
+	pageContent := resp.String()
+	mid := ""
+
+	if strings.Contains(pageContent, "mid=") {
+		start := strings.Index(pageContent, "mid=")
+		if start != -1 {
+			start += 4 // Skip "mid="
+			end := strings.IndexAny(pageContent[start:], "&\"' \n\r\t")
+			if end != -1 {
+				mid = pageContent[start : start+end]
+			}
+		}
+	}
+
+	loginURL := c.baseURL + "/ajax/renovate/loginandout.ajax"
+
+	loginData := map[string]string{
+		"userid":          username,
+		"password":        password,
+		"override":        "false",
+		"keepme_loggedin": "false",
+		"impersonate":     "false",
+		"mid":             mid,
+		"pageid":          "MAIN",
+		"login_to":        "",
+	}
+
+	loginResp, err := c.httpClient.R().
+		SetContext(ctx).
+		SetFormData(loginData).
+		SetHeader("Referer", c.baseURL+"/").
+		SetHeader("X-Requested-With", "XMLHttpRequest").
+		SetHeader("Content-Type", "application/x-www-form-urlencoded").
+		Post(loginURL)
+
+	if err != nil {
+		return fmt.Errorf("login request failed: %w", err)
+	}
+
+	if loginResp.IsError() {
+		return fmt.Errorf("login failed with HTTP error: %d %s", loginResp.StatusCode(), loginResp.Status())
+	}
+
+	responseBody := loginResp.String()
+
+	if strings.Contains(responseBody, `"returnCode":0`) ||
+		strings.Contains(responseBody, `"returnCode": 0`) {
+		log.Infof("✅ Successfully logged in to BrickLink as %s", username)
+		return nil
+	}
+
+	if strings.Contains(responseBody, "Invalid User ID") ||
+		strings.Contains(responseBody, "Invalid Password") ||
+		strings.Contains(responseBody, `"returnCode":-1`) {
+		return fmt.Errorf("login failed: invalid credentials")
+	}
+
+	if strings.Contains(responseBody, "Invalid Method") {
+		return fmt.Errorf("login failed: invalid method - may need additional parameters")
+	}
+
+	log.Warnf("⚠️ Login response: %s", responseBody)
+	return fmt.Errorf("login failed: unexpected response")
+}
+
 func (c *brickLinkClient) fetchHTML(ctx context.Context, url string) (string, error) {
 	if c.isCircuitBreakerOpen() {
 		remaining := c.getRemainingCircuitBreakerTime()
@@ -327,38 +408,16 @@ func (c *brickLinkClient) fetchHTML(ctx context.Context, url string) (string, er
 	}
 
 	html := resp.String()
+
+	// Check for login required
+	if strings.Contains(html, "login.asp") && strings.Contains(html, "Please log in") {
+		return "", fmt.Errorf("login required but session expired - restart the application to re-login")
+	}
+
 	if strings.Contains(html, "Quota Exceeded") {
 		log.Warnf("🚫 Rate limit exceeded for URL: %s", url)
-
-		proxyRetrySuccessful := false
-		if c.proxySupplier != nil {
-			if newProxy := c.proxySupplier.Get(); newProxy != "" {
-				log.Infof("🔄 Switching to new proxy: %s", newProxy)
-				c.httpClient.SetProxy(newProxy)
-
-				// Retry with new proxy immediately (no sleep)
-				log.Infof("🔄 Retrying with new proxy...")
-
-				retryResp, retryErr := c.httpClient.R().
-					SetContext(reqCtx).
-					Get(url)
-
-				if retryErr == nil && !retryResp.IsError() {
-					retryHTML := retryResp.String()
-					if !strings.Contains(retryHTML, "Quota Exceeded") {
-						log.Infof("✅ Retry successful with new proxy")
-						proxyRetrySuccessful = true
-						return retryHTML, nil
-					}
-				}
-			}
-		}
-
-		// If proxy retry failed or no proxy available, trigger circuit breaker
-		if !proxyRetrySuccessful {
-			c.triggerCircuitBreaker()
-			return "", fmt.Errorf("quota exceeded - circuit breaker activated for 30 minutes")
-		}
+		c.triggerCircuitBreaker()
+		return "", fmt.Errorf("quota exceeded - circuit breaker activated for 30 minutes")
 	}
 
 	return html, nil

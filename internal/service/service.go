@@ -324,9 +324,6 @@ func (s *Service) retryPage(ctx context.Context, retryTask *task.PageRetryTask) 
 	// Increment retry count
 	retryTask.RetryCount++
 
-	log.Infof("🔄 Retrying page %d for %s (attempt %d)",
-		retryTask.PageNumber, retryTask.CategoryType, retryTask.RetryCount)
-
 	// Try to fetch the page again
 	page, err := s.client.GetCatalogPage(ctx, retryTask.CategoryType, retryTask.PageNumber)
 	if err != nil {
@@ -343,8 +340,6 @@ func (s *Service) retryPage(ctx context.Context, retryTask *task.PageRetryTask) 
 			return addErr
 		}
 
-		log.Warnf("🔄 Page %d for %s failed again, will retry (attempt %d): %v",
-			retryTask.PageNumber, retryTask.CategoryType, retryTask.RetryCount, err)
 		return nil
 	}
 
@@ -366,11 +361,7 @@ func (s *Service) retryPage(ctx context.Context, retryTask *task.PageRetryTask) 
 }
 
 func (s *Service) retryItem(ctx context.Context, itemRetryTask *task.ItemRetryTask) error {
-	// Increment retry count
 	itemRetryTask.RetryCount++
-
-	log.Infof("🔄 Retrying item %s (%s stage, attempt %d)",
-		itemRetryTask.ItemID, itemRetryTask.FailureStage, itemRetryTask.RetryCount)
 
 	switch itemRetryTask.FailureStage {
 	case "fetch":
@@ -392,8 +383,6 @@ func (s *Service) retryItem(ctx context.Context, itemRetryTask *task.ItemRetryTa
 				return addErr
 			}
 
-			log.Warnf("🔄 Item %s fetch failed again, will retry (attempt %d): %v",
-				itemRetryTask.ItemID, itemRetryTask.RetryCount, err)
 			return nil
 		}
 
