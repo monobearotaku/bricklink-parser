@@ -11,6 +11,7 @@ import (
 
 	"bricklink/parser/internal/config"
 	"bricklink/parser/internal/domain"
+	"bricklink/parser/internal/domain/task"
 	"bricklink/parser/internal/queue"
 
 	"sync/atomic"
@@ -190,7 +191,19 @@ func (c *brickLinkClient) GetAllCatalogPagesCh(ctx context.Context, categoryType
 
 					page, err := c.GetCatalogPage(ctx, categoryType, pageNum)
 					if err != nil {
-						log.Errorf("Failed to fetch page %d: %v", pageNum, err)
+						// Add to retry queue instead of just logging and giving up
+						retryTask := &task.PageRetryTask{
+							PageNumber:   pageNum,
+							CategoryType: categoryType,
+							Error:        err.Error(),
+						}
+
+						if _, addErr := c.queue.AddTask(ctx, retryTask); addErr != nil {
+							log.Errorf("❌ Failed to add retry task for page %d: %v", pageNum, addErr)
+						} else {
+							log.Warnf("🔄 Added page %d to retry queue due to fetch error: %v", pageNum, err)
+						}
+
 						<-semaphore
 						return
 					}
