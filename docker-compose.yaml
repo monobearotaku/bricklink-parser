@@ -24,25 +24,44 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-    restart: unless-stopped
-
-  bricklink-parser:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: bricklink-parser
     environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-    depends_on:
-      - redis
+      - ALLOW_EMPTY_PASSWORD=yes
+    command: >
+      keydb-server
+      --maxmemory 2gb
+      --maxmemory-policy noeviction
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+      --appendonly yes
+      --appendfsync everysec
+      --auto-aof-rewrite-percentage 100
+      --auto-aof-rewrite-min-size 64mb
+      --stop-writes-on-bgsave-error yes
+      --rdbcompression yes
+      --rdbchecksum yes
+      --dir /data
+    healthcheck:
+      test: ["CMD", "keydb-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped
-    vo
+    mem_limit: 3gb
+    memswap_limit: 3gb
+
+  # bricklink-parser:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   container_name: bricklink-parser
+  #   environment:
+  #     - REDIS_HOST=redis
+  #     - REDIS_PORT=6379
+  #   depends_on:
+  #     - redis
+  #   restart: unless-stopped
     
 volumes:
   postgres_data:

@@ -36,6 +36,11 @@ type brickLinkClient struct {
 	parser        *catalogParser
 	proxySupplier proxy.ProxySupplier
 	queue         queue.Queue
+
+	// Circuit breaker for quota exceeded
+	circuitBreakerMutex sync.RWMutex
+	quotaExceededUntil  time.Time
+	circuitBreakerDelay time.Duration
 }
 
 func NewBrickLinkClient(cfg config.BrickLinkConfig, proxySupplier proxy.ProxySupplier, queue queue.Queue) BrickLinkClient {
@@ -60,13 +65,14 @@ func NewBrickLinkClient(cfg config.BrickLinkConfig, proxySupplier proxy.ProxySup
 	}
 
 	return &brickLinkClient{
-		rl:            ratelimit.New(cfg.MaxRequestsPerSecond),
-		config:        cfg,
-		baseURL:       cfg.BaseURL,
-		httpClient:    client,
-		parser:        newCatalogParser(cfg.BaseURL),
-		proxySupplier: proxySupplier,
-		queue:         queue,
+		rl:                  ratelimit.New(cfg.MaxRequestsPerSecond),
+		config:              cfg,
+		baseURL:             cfg.BaseURL,
+		httpClient:          client,
+		parser:              newCatalogParser(cfg.BaseURL),
+		proxySupplier:       proxySupplier,
+		queue:               queue,
+		circuitBreakerDelay: 30 * time.Minute,
 	}
 }
 
@@ -173,7 +179,7 @@ func (c *brickLinkClient) GetAllCatalogPagesCh(ctx context.Context, categoryType
 	pagesChan := make(chan *domain.CatalogPage, firstPage.TotalPages)
 	pagesChan <- firstPage
 
-	if firstPage.TotalPages >= startPage {
+	if firstPage.TotalPages > startPage {
 		var atomicPageNumber atomic.Int32
 		atomicPageNumber.Store(int32(startPage))
 
@@ -250,7 +256,54 @@ func (c *brickLinkClient) GetItemDetails(ctx context.Context, itemType domain.Ca
 	return details, nil
 }
 
+func (c *brickLinkClient) isCircuitBreakerOpen() bool {
+	c.circuitBreakerMutex.RLock()
+	now := time.Now()
+	wasOpen := now.Before(c.quotaExceededUntil)
+	wasTriggered := !c.quotaExceededUntil.IsZero()
+	c.circuitBreakerMutex.RUnlock()
+
+	// If circuit breaker was triggered but is now expired, log re-enabling
+	if !wasOpen && wasTriggered {
+		c.circuitBreakerMutex.Lock()
+		// Double-check after acquiring write lock
+		if !c.quotaExceededUntil.IsZero() && now.After(c.quotaExceededUntil) {
+			c.quotaExceededUntil = time.Time{} // Reset to avoid repeated logging
+			log.Infof("✅ Circuit breaker automatically re-enabled - requests are now allowed")
+		}
+		c.circuitBreakerMutex.Unlock()
+	}
+
+	return wasOpen
+}
+
+func (c *brickLinkClient) triggerCircuitBreaker() {
+	c.circuitBreakerMutex.Lock()
+	defer c.circuitBreakerMutex.Unlock()
+
+	c.quotaExceededUntil = time.Now().Add(c.circuitBreakerDelay)
+	log.Warnf("🚫 Circuit breaker activated! All requests disabled until %v (30 minutes)",
+		c.quotaExceededUntil.Format("15:04:05"))
+}
+
+func (c *brickLinkClient) getRemainingCircuitBreakerTime() time.Duration {
+	c.circuitBreakerMutex.RLock()
+	defer c.circuitBreakerMutex.RUnlock()
+
+	remaining := time.Until(c.quotaExceededUntil)
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
 func (c *brickLinkClient) fetchHTML(ctx context.Context, url string) (string, error) {
+	if c.isCircuitBreakerOpen() {
+		remaining := c.getRemainingCircuitBreakerTime()
+		log.Debugf("🚫 Request blocked by circuit breaker. Remaining time: %v", remaining.Round(time.Second))
+		return "", fmt.Errorf("circuit breaker is open - requests disabled for %v more", remaining.Round(time.Second))
+	}
+
 	c.rl.Take()
 
 	// Create a context with a longer timeout for individual requests
@@ -275,11 +328,9 @@ func (c *brickLinkClient) fetchHTML(ctx context.Context, url string) (string, er
 
 	html := resp.String()
 	if strings.Contains(html, "Quota Exceeded") {
-		time.Sleep(120 * time.Second)
-
 		log.Warnf("🚫 Rate limit exceeded for URL: %s", url)
 
-		// Try to get a new proxy from ProxySupplier
+		proxyRetrySuccessful := false
 		if c.proxySupplier != nil {
 			if newProxy := c.proxySupplier.Get(); newProxy != "" {
 				log.Infof("🔄 Switching to new proxy: %s", newProxy)
@@ -292,26 +343,22 @@ func (c *brickLinkClient) fetchHTML(ctx context.Context, url string) (string, er
 					SetContext(reqCtx).
 					Get(url)
 
-				if retryErr != nil {
-					// Check parent context again
-					if ctx.Err() != nil {
-						return "", fmt.Errorf("retry cancelled: %w", ctx.Err())
-					}
-					return "", fmt.Errorf("retry failed: %w", retryErr)
-				}
-
-				if !retryResp.IsError() {
+				if retryErr == nil && !retryResp.IsError() {
 					retryHTML := retryResp.String()
 					if !strings.Contains(retryHTML, "Quota Exceeded") {
 						log.Infof("✅ Retry successful with new proxy")
+						proxyRetrySuccessful = true
 						return retryHTML, nil
 					}
 				}
 			}
 		}
 
-		// If no proxy available or retry failed, return quota error
-		return "", fmt.Errorf("quota exceeded and no working proxy available")
+		// If proxy retry failed or no proxy available, trigger circuit breaker
+		if !proxyRetrySuccessful {
+			c.triggerCircuitBreaker()
+			return "", fmt.Errorf("quota exceeded - circuit breaker activated for 30 minutes")
+		}
 	}
 
 	return html, nil
